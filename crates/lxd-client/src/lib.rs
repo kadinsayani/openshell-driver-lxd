@@ -6,6 +6,7 @@
 mod client;
 mod error;
 mod instances;
+mod networks;
 mod operations;
 pub mod resources;
 mod types;
@@ -14,5 +15,5 @@ pub use client::{LxdClient, LxdEndpoint, LxdHttpsConfig};
 pub use error::LxdError;
 pub use types::{
     Instance, InstanceState, InstanceStateCpu, InstanceStateDisk, InstanceStateMemory,
-    InstanceStateNetwork, InstanceStateNetworkAddress, LxdServerInfo, Operation,
+    InstanceStateNetwork, InstanceStateNetworkAddress, LxdServerInfo, Network, Operation,
 };
