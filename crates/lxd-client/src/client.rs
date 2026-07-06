@@ -30,18 +30,22 @@ use crate::types::LxdResponse;
 pub(crate) enum RawStream {
     /// Local LXD daemon over a Unix domain socket.
     Unix(UnixStream),
+    /// Remote LXD cluster; TLS handshake already completed.
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
 impl RawStream {
     fn as_read(&mut self) -> Pin<&mut (dyn AsyncRead + Unpin)> {
         match self {
             RawStream::Unix(s) => Pin::new(s),
+            RawStream::Tls(s) => Pin::new(s),
         }
     }
 
     fn as_write(&mut self) -> Pin<&mut (dyn AsyncWrite + Unpin)> {
         match self {
             RawStream::Unix(s) => Pin::new(s),
+            RawStream::Tls(s) => Pin::new(s),
         }
     }
 }
@@ -71,27 +75,143 @@ impl Unpin for RawStream {}
 pub enum LxdEndpoint {
     /// Local LXD daemon over a Unix domain socket.
     UnixSocket(PathBuf),
+    /// Remote LXD cluster over HTTPS with mutual TLS.
+    Https(LxdHttpsConfig),
+}
+
+/// Configuration for HTTPS+mTLS connections to a remote LXD cluster.
+#[derive(Debug, Clone)]
+pub struct LxdHttpsConfig {
+    /// LXD HTTPS endpoint, e.g. `"https://10.0.0.1:8443"`.
+    pub url: String,
+    /// Path to the PEM-encoded client certificate for mTLS.
+    pub client_cert: PathBuf,
+    /// Path to the PEM-encoded client private key for mTLS.
+    pub client_key: PathBuf,
+    /// Path to a PEM-encoded CA certificate to verify the server cert.
+    /// `None` uses the webpki CA bundle.
+    pub server_ca: Option<PathBuf>,
+}
+
+impl LxdHttpsConfig {
+    pub(crate) fn host_port(&self) -> String {
+        let s = self.url.trim_start_matches("https://");
+        if s.contains(':') {
+            s.to_string()
+        } else {
+            format!("{s}:8443")
+        }
+    }
+
+    fn hostname(&self) -> String {
+        let hp = self.host_port();
+        hp.split(':').next().unwrap_or(&hp).to_string()
+    }
+
+    pub(crate) fn server_name(
+        &self,
+    ) -> Result<rustls::pki_types::ServerName<'static>, LxdError> {
+        rustls::pki_types::ServerName::try_from(self.hostname())
+            .map_err(|e| LxdError::TlsError(format!("invalid server name: {e}")))
+    }
+
+    pub(crate) fn build_connector(&self) -> Result<tokio_rustls::TlsConnector, LxdError> {
+        use std::fs::File;
+        use std::io::BufReader;
+        use std::sync::Arc;
+
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls_pemfile::{certs, private_key};
+
+        let cert_file = File::open(&self.client_cert)
+            .map_err(|e| LxdError::TlsError(format!("cannot open client cert: {e}")))?;
+        let client_certs: Vec<CertificateDer<'static>> = certs(&mut BufReader::new(cert_file))
+            .collect::<Result<_, _>>()
+            .map_err(|e| LxdError::TlsError(format!("invalid client cert PEM: {e}")))?;
+
+        let key_file = File::open(&self.client_key)
+            .map_err(|e| LxdError::TlsError(format!("cannot open client key: {e}")))?;
+        let key: PrivateKeyDer<'static> =
+            private_key(&mut BufReader::new(key_file))
+                .map_err(|e| LxdError::TlsError(format!("invalid client key PEM: {e}")))?
+                .ok_or_else(|| LxdError::TlsError("no private key in PEM file".into()))?;
+
+        let root_store = if let Some(ca_path) = &self.server_ca {
+            let ca_file = File::open(ca_path)
+                .map_err(|e| LxdError::TlsError(format!("cannot open server CA: {e}")))?;
+            let ca_certs: Vec<CertificateDer<'static>> =
+                certs(&mut BufReader::new(ca_file))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| LxdError::TlsError(format!("invalid server CA PEM: {e}")))?;
+            let mut store = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                store
+                    .add(cert)
+                    .map_err(|e| LxdError::TlsError(format!("invalid CA cert: {e}")))?;
+            }
+            store
+        } else {
+            let mut store = rustls::RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            store
+        };
+
+        let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| LxdError::TlsError(format!("TLS protocol error: {e}")))?
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, key)
+        .map_err(|e| LxdError::TlsError(format!("TLS cert error: {e}")))?;
+
+        Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+    }
 }
 
 /// Async client for the LXD REST API.
 ///
 /// Opens a fresh connection per request. Use [`LxdEndpoint::UnixSocket`] for a
-/// local LXD snap installation.
-#[derive(Clone, Debug)]
+/// local LXD snap installation, or [`LxdEndpoint::Https`] for a remote LXD
+/// cluster over HTTPS+mTLS.
+#[derive(Clone)]
 pub struct LxdClient {
     endpoint: LxdEndpoint,
+    /// Pre-built TLS connector, cached at construction to avoid re-reading cert
+    /// files on every request.
+    tls_connector: Option<tokio_rustls::TlsConnector>,
+}
+
+impl fmt::Debug for LxdClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LxdClient")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LxdClient {
     /// Creates a client for the given [`LxdEndpoint`].
+    ///
+    /// For [`LxdEndpoint::UnixSocket`] this is infallible in practice.
+    /// For [`LxdEndpoint::Https`] this reads cert files from disk once to
+    /// build the [`tokio_rustls::TlsConnector`]; subsequent requests reuse it.
     pub fn new(endpoint: LxdEndpoint) -> Result<Self, LxdError> {
-        Ok(Self { endpoint })
+        let tls_connector = match &endpoint {
+            LxdEndpoint::Https(config) => Some(config.build_connector()?),
+            _ => None,
+        };
+        Ok(Self {
+            endpoint,
+            tls_connector,
+        })
     }
 
     /// WebSocket scheme for the configured endpoint (`"ws"` or `"wss"`).
     pub(crate) fn ws_scheme(&self) -> &'static str {
         match &self.endpoint {
             LxdEndpoint::UnixSocket(_) => "ws",
+            LxdEndpoint::Https(_) => "wss",
         }
     }
 
@@ -104,6 +224,20 @@ impl LxdClient {
             LxdEndpoint::UnixSocket(socket_path) => {
                 let stream = UnixStream::connect(socket_path).await?;
                 Ok((RawStream::Unix(stream), "localhost".to_string()))
+            }
+            LxdEndpoint::Https(config) => {
+                use tokio::net::TcpStream;
+                let connector = self
+                    .tls_connector
+                    .as_ref()
+                    .expect("tls_connector is always Some when endpoint is Https");
+                let tcp = TcpStream::connect(config.host_port()).await?;
+                let server_name = config.server_name()?;
+                let tls = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(LxdError::Io)?;
+                Ok((RawStream::Tls(Box::new(tls)), config.host_port()))
             }
         }
     }
