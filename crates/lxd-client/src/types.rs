@@ -171,6 +171,18 @@ pub struct LxdServerInfo {
     pub api_extensions: Vec<String>,
 }
 
+/// A single event frame from `GET /1.0/events`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LxdEvent {
+    /// ISO-8601 timestamp of the event.
+    pub timestamp: String,
+    /// Event type: `"operation"`, `"lifecycle"`, `"logging"`, etc.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Raw event payload; shape varies by `type_`.
+    pub metadata: serde_json::Value,
+}
+
 /// A managed network, as returned by `GET /1.0/networks/<name>`.
 ///
 /// `config` keys of interest: `ipv4.address` / `ipv6.address` hold the
